@@ -156,57 +156,89 @@ pub fn play_custom_file<P: AsRef<std::path::Path>>(
     Ok(())
 }
 
+/// Error from starting a [`LoopPlayer`]
+#[derive(Debug)]
+#[cfg_attr(not(feature = "audio"), allow(dead_code))]
+pub enum LoopError {
+    /// The audio data cannot play. A retry gives the same result.
+    Permanent(String),
+    /// The audio device is not available now. A retry can succeed.
+    Transient(String),
+}
+
+impl LoopError {
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient(_))
+    }
+}
+
+impl std::fmt::Display for LoopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Permanent(msg) | Self::Transient(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for LoopError {}
+
 /// Looping playback that runs until the handle is dropped.
 ///
-/// A dedicated thread owns the audio device for the lifetime of the loop and
-/// releases it when the handle drops.
+/// A dedicated thread owns the audio device for the lifetime of the loop.
+/// Drop stops playback and waits for the thread to release the device.
 pub struct LoopPlayer {
     #[cfg(feature = "audio")]
     stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    #[cfg(feature = "audio")]
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 #[cfg(feature = "audio")]
 impl LoopPlayer {
     /// Start looping the embedded tick sound
-    pub fn embedded(volume: f32) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn embedded(volume: f32) -> Result<Self, LoopError> {
         if TICK_SOUND.len() <= 44 {
-            return Err("embedded tick sound is a placeholder".into());
+            return Err(LoopError::Permanent(
+                "embedded tick sound is a placeholder".into(),
+            ));
         }
         Self::from_bytes(TICK_SOUND.to_vec(), volume)
     }
 
     /// Start looping a user-supplied audio file
-    pub fn from_file<P: AsRef<std::path::Path>>(
-        path: P,
-        volume: f32,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let data = std::fs::read(path)?;
+    pub fn from_file<P: AsRef<std::path::Path>>(path: P, volume: f32) -> Result<Self, LoopError> {
+        let data = std::fs::read(path).map_err(|e| LoopError::Permanent(e.to_string()))?;
         Self::from_bytes(data, volume)
     }
 
-    fn from_bytes(data: Vec<u8>, volume: f32) -> Result<Self, Box<dyn std::error::Error>> {
+    fn from_bytes(data: Vec<u8>, volume: f32) -> Result<Self, LoopError> {
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), LoopError>>();
 
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("tomat-running-sound".into())
             .spawn(move || {
+                // Decode first so bad data is permanent even when the device is down
+                let source = match Decoder::new_looped(Cursor::new(data)) {
+                    Ok(source) => source,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(LoopError::Permanent(format!(
+                            "cannot decode audio: {e}"
+                        ))));
+                        return;
+                    }
+                };
+
                 let mut handle = match rodio::stream::DeviceSinkBuilder::open_default_sink() {
                     Ok(handle) => handle,
                     Err(e) => {
-                        let _ = ready_tx.send(Err(format!("cannot open audio device: {e}")));
+                        let _ = ready_tx.send(Err(LoopError::Transient(format!(
+                            "cannot open audio device: {e}"
+                        ))));
                         return;
                     }
                 };
                 handle.log_on_drop(false);
-
-                let source = match Decoder::new_looped(Cursor::new(data)) {
-                    Ok(source) => source,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(format!("cannot decode audio: {e}")));
-                        return;
-                    }
-                };
 
                 let player = rodio::Player::connect_new(handle.mixer());
                 player.append(source.amplify(volume));
@@ -216,13 +248,23 @@ impl LoopPlayer {
                 let _ = stop_rx.recv();
                 player.stop();
                 // `player` and `handle` drop here, releasing the audio device
-            })?;
+            })
+            .map_err(|e| LoopError::Transient(format!("cannot spawn audio thread: {e}")))?;
 
-        ready_rx.recv()??;
-
-        Ok(Self {
-            stop_tx: Some(stop_tx),
-        })
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                stop_tx: Some(stop_tx),
+                worker: Some(worker),
+            }),
+            Ok(Err(e)) => {
+                let _ = worker.join();
+                Err(e)
+            }
+            Err(_) => {
+                let _ = worker.join();
+                Err(LoopError::Transient("audio thread exited early".into()))
+            }
+        }
     }
 }
 
@@ -232,19 +274,20 @@ impl Drop for LoopPlayer {
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
         }
+        // Wait so a new loop can open the device right after this one
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
 #[cfg(not(feature = "audio"))]
 impl LoopPlayer {
-    pub fn embedded(_volume: f32) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn embedded(_volume: f32) -> Result<Self, LoopError> {
         Ok(Self {})
     }
 
-    pub fn from_file<P: AsRef<std::path::Path>>(
-        _path: P,
-        _volume: f32,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_file<P: AsRef<std::path::Path>>(_path: P, _volume: f32) -> Result<Self, LoopError> {
         Ok(Self {})
     }
 }
@@ -296,5 +339,24 @@ mod tests {
             assert!(!WORK_TO_LONG_BREAK_SOUND.is_empty());
             assert!(TICK_SOUND.len() > 44);
         }
+    }
+
+    #[test]
+    #[cfg(feature = "audio")]
+    fn test_loop_player_missing_file_is_permanent() {
+        let err = LoopPlayer::from_file("/nonexistent/tomat/loop.ogg", 0.5)
+            .err()
+            .expect("missing file must fail");
+        assert!(!err.is_transient());
+    }
+
+    #[test]
+    #[cfg(feature = "audio")]
+    fn test_loop_player_undecodable_data_is_permanent() {
+        // Decode runs before device open, so this holds without an audio device
+        let err = LoopPlayer::from_bytes(b"not audio".to_vec(), 0.5)
+            .err()
+            .expect("bad data must fail");
+        assert!(!err.is_transient());
     }
 }

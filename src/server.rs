@@ -306,12 +306,35 @@ fn execute_hook(hooks: &crate::config::HooksConfig, event: &str, state: &TimerSt
     });
 }
 
+/// Minimum delay between attempts to open the audio device for the running sound
+const RUNNING_SOUND_RETRY: Duration = Duration::from_secs(5);
+
+/// Next action after a failed running sound start
+enum RunningSoundRetry {
+    /// No failure in this running period
+    Ready,
+    /// Retry the device at this time
+    At(std::time::Instant),
+    /// The audio data cannot play, so do not retry in this running period
+    Blocked,
+}
+
 /// Keeps the looping running sound in step with the timer state
-#[derive(Default)]
-struct RunningSound {
-    player: Option<crate::audio::LoopPlayer>,
-    /// Set after a failed start so the error is logged once per running period
-    failed: bool,
+struct RunningSound<P = crate::audio::LoopPlayer> {
+    player: Option<P>,
+    retry: RunningSoundRetry,
+    /// Set after a transient failure is logged, so retries do not flood the log
+    transient_logged: bool,
+}
+
+impl<P> Default for RunningSound<P> {
+    fn default() -> Self {
+        Self {
+            player: None,
+            retry: RunningSoundRetry::Ready,
+            transient_logged: false,
+        }
+    }
 }
 
 impl RunningSound {
@@ -319,26 +342,81 @@ impl RunningSound {
     fn sync(&mut self, state: &TimerState, config: &crate::config::SoundConfig) {
         let should_play =
             std::env::var("TOMAT_TESTING").is_err() && running_sound_wanted(state, config);
+        let volume = config.running_sound_volume();
+        let file = config.running.file.as_deref();
+        let label = match file {
+            Some(file) => format!("running sound '{}'", file),
+            None => "embedded running sound".to_string(),
+        };
 
+        self.apply(
+            should_play,
+            std::time::Instant::now(),
+            &label,
+            || match file {
+                Some(file) => crate::audio::LoopPlayer::from_file(file, volume),
+                None => crate::audio::LoopPlayer::embedded(volume),
+            },
+        );
+    }
+}
+
+impl<P> RunningSound<P> {
+    /// Move toward `should_play`, calling `start` only when a new loop must start
+    fn apply(
+        &mut self,
+        should_play: bool,
+        now: std::time::Instant,
+        label: &str,
+        start: impl FnOnce() -> Result<P, crate::audio::LoopError>,
+    ) {
         if !should_play {
             // Dropping the player stops playback and releases the audio device
             self.player = None;
-            self.failed = false;
-        } else if self.player.is_none() && !self.failed {
-            let volume = config.running_sound_volume();
-            let result = match &config.running.file {
-                Some(file) => crate::audio::LoopPlayer::from_file(file, volume)
-                    .map_err(|e| format!("Failed to play running sound '{}': {}", file, e)),
-                None => crate::audio::LoopPlayer::embedded(volume)
-                    .map_err(|e| format!("Failed to play embedded running sound: {}", e)),
-            };
-            match result {
-                Ok(player) => self.player = Some(player),
-                Err(msg) => {
-                    eprintln!("{}", msg);
-                    self.failed = true;
-                }
+            self.retry = RunningSoundRetry::Ready;
+            self.transient_logged = false;
+            return;
+        }
+
+        if self.player.is_some() {
+            return;
+        }
+        match self.retry {
+            RunningSoundRetry::Blocked => return,
+            RunningSoundRetry::At(at) if now < at => return,
+            _ => {}
+        }
+
+        match start() {
+            Ok(player) => {
+                self.player = Some(player);
+                self.retry = RunningSoundRetry::Ready;
+                self.transient_logged = false;
             }
+            Err(e) if e.is_transient() => {
+                if !self.transient_logged {
+                    eprintln!(
+                        "Failed to play {}: {} (retrying every {}s)",
+                        label,
+                        e,
+                        RUNNING_SOUND_RETRY.as_secs()
+                    );
+                    self.transient_logged = true;
+                }
+                self.retry = RunningSoundRetry::At(now + RUNNING_SOUND_RETRY);
+            }
+            Err(e) => {
+                eprintln!("Failed to play {}: {}", label, e);
+                self.retry = RunningSoundRetry::Blocked;
+            }
+        }
+    }
+
+    /// Time of the next device retry, if one is pending
+    fn retry_deadline(&self) -> Option<std::time::Instant> {
+        match (&self.player, &self.retry) {
+            (None, RunningSoundRetry::At(at)) => Some(*at),
+            _ => None,
         }
     }
 }
@@ -820,7 +898,16 @@ async fn daemon_loop(
     running_sound.sync(state, &config.sound);
 
     loop {
+        let retry_at = running_sound.retry_deadline();
+
         tokio::select! {
+            // Retry the running sound when the audio device was not available
+            _ = tokio::time::sleep_until(
+                retry_at.map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std)
+            ), if retry_at.is_some() => {
+                running_sound.sync(state, &config.sound);
+            }
+
             // Handle incoming connections
             Ok((stream, _)) = listener.accept() => {
                 match handle_client(stream, state, config).await {
@@ -1585,6 +1672,85 @@ mod tests {
         ));
     }
 
+    fn transient() -> Result<(), crate::audio::LoopError> {
+        Err(crate::audio::LoopError::Transient("device busy".into()))
+    }
+
+    fn permanent() -> Result<(), crate::audio::LoopError> {
+        Err(crate::audio::LoopError::Permanent("bad file".into()))
+    }
+
+    #[test]
+    fn test_running_sound_retries_transient_failure_after_delay() {
+        let mut rs = RunningSound::<()>::default();
+        let t0 = std::time::Instant::now();
+        let mut calls = 0;
+
+        rs.apply(true, t0, "test", || {
+            calls += 1;
+            transient()
+        });
+        assert!(rs.player.is_none());
+        assert_eq!(rs.retry_deadline(), Some(t0 + RUNNING_SOUND_RETRY));
+
+        // Before the deadline, do not try again
+        rs.apply(true, t0 + Duration::from_secs(1), "test", || {
+            calls += 1;
+            transient()
+        });
+        assert_eq!(calls, 1);
+
+        // At the deadline, try again and succeed
+        rs.apply(true, t0 + RUNNING_SOUND_RETRY, "test", || {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!(calls, 2);
+        assert!(rs.player.is_some());
+        assert_eq!(rs.retry_deadline(), None);
+    }
+
+    #[test]
+    fn test_running_sound_blocks_permanent_failure_until_stopped() {
+        let mut rs = RunningSound::<()>::default();
+        let t0 = std::time::Instant::now();
+        let mut calls = 0;
+
+        rs.apply(true, t0, "test", || {
+            calls += 1;
+            permanent()
+        });
+        assert_eq!(rs.retry_deadline(), None);
+
+        rs.apply(true, t0 + Duration::from_secs(60), "test", || {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!(calls, 1, "permanent failure must not retry");
+        assert!(rs.player.is_none());
+
+        // Pause clears the block, so the next running period tries again
+        rs.apply(false, t0, "test", || unreachable!());
+        rs.apply(true, t0, "test", || {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!(calls, 2);
+        assert!(rs.player.is_some());
+    }
+
+    #[test]
+    fn test_running_sound_stop_clears_pending_retry() {
+        let mut rs = RunningSound::<()>::default();
+        let t0 = std::time::Instant::now();
+        rs.apply(true, t0, "test", transient);
+        assert!(rs.retry_deadline().is_some());
+
+        rs.apply(false, t0, "test", || unreachable!());
+        assert_eq!(rs.retry_deadline(), None);
+        assert!(!rs.transient_logged);
+    }
+
     #[test]
     fn test_running_sound_sync_is_noop_under_test_env() {
         // SAFETY: Setting environment variable during tests is safe as tests have isolated environments
@@ -1593,7 +1759,7 @@ mod tests {
         }
         let mut state = TimerState::new(25.0, 5.0, 15.0, 4);
         state.start_work();
-        let mut running = RunningSound::default();
+        let mut running: RunningSound = RunningSound::default();
         running.sync(&state, &running_sound_config(true, &["work"]));
         assert!(running.player.is_none());
     }
