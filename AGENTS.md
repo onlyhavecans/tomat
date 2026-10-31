@@ -456,6 +456,11 @@ enabled = true        # Enable sound notifications
 system_beep = false  # Use system beep
 use_embedded = true  # Use embedded sound files
 volume = 0.5         # Volume level (0.0-1.0)
+
+[sound.running]
+enabled = false      # Loop a sound while the timer counts down
+phases = ["work"]    # "work", "break", "long-break"
+# file = "/path/to/loop.ogg"  # Overrides the embedded tick
 ```
 
 **Notification Configuration:**

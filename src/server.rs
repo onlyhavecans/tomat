@@ -306,6 +306,62 @@ fn execute_hook(hooks: &crate::config::HooksConfig, event: &str, state: &TimerSt
     });
 }
 
+/// Keeps the looping running sound in step with the timer state
+#[derive(Default)]
+struct RunningSound {
+    player: Option<crate::audio::LoopPlayer>,
+    /// Set after a failed start so the error is logged once per running period
+    failed: bool,
+}
+
+impl RunningSound {
+    /// Start or stop the loop so it matches `state`
+    fn sync(&mut self, state: &TimerState, config: &crate::config::SoundConfig) {
+        let should_play =
+            std::env::var("TOMAT_TESTING").is_err() && running_sound_wanted(state, config);
+
+        if !should_play {
+            // Dropping the player stops playback and releases the audio device
+            self.player = None;
+            self.failed = false;
+        } else if self.player.is_none() && !self.failed {
+            let volume = config.running_sound_volume();
+            let result = match &config.running.file {
+                Some(file) => crate::audio::LoopPlayer::from_file(file, volume)
+                    .map_err(|e| format!("Failed to play running sound '{}': {}", file, e)),
+                None => crate::audio::LoopPlayer::embedded(volume)
+                    .map_err(|e| format!("Failed to play embedded running sound: {}", e)),
+            };
+            match result {
+                Ok(player) => self.player = Some(player),
+                Err(msg) => {
+                    eprintln!("{}", msg);
+                    self.failed = true;
+                }
+            }
+        }
+    }
+}
+
+/// True when the running sound is configured for the current phase and the timer counts down
+fn running_sound_wanted(state: &TimerState, config: &crate::config::SoundConfig) -> bool {
+    use crate::config::RunningSoundPhase;
+    use crate::timer::Phase;
+
+    if state.is_paused {
+        return false;
+    }
+
+    let phase = match state.phase {
+        Phase::Idle => return false,
+        Phase::Work => RunningSoundPhase::Work,
+        Phase::Break => RunningSoundPhase::Break,
+        Phase::LongBreak => RunningSoundPhase::LongBreak,
+    };
+
+    config.running_sound_enabled_for(phase)
+}
+
 async fn handle_client(
     stream: UnixStream,
     state: &mut TimerState,
@@ -759,6 +815,10 @@ async fn daemon_loop(
     config: &crate::config::Config,
     quiet: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Dropped on return, which stops the loop on shutdown
+    let mut running_sound = RunningSound::default();
+    running_sound.sync(state, &config.sound);
+
     loop {
         tokio::select! {
             // Handle incoming connections
@@ -775,6 +835,7 @@ async fn daemon_loop(
                     }
                     _ => {}
                 }
+                running_sound.sync(state, &config.sound);
             }
 
             // Check timer completion with precise timing
@@ -803,6 +864,7 @@ async fn daemon_loop(
                     }
                     // Save state after automatic phase transition
                     save_state(state);
+                    running_sound.sync(state, &config.sound);
                 }
             }
         }
@@ -1455,6 +1517,85 @@ mod tests {
             crate::config::AutoAdvanceMode::All
         );
         assert!(!loaded_state.is_paused);
+    }
+
+    fn running_sound_config(enabled: bool, phases: &[&str]) -> crate::config::SoundConfig {
+        let phases = phases
+            .iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let toml_str = format!("[running]\nenabled = {enabled}\nphases = [{phases}]");
+        toml::from_str(&toml_str).unwrap()
+    }
+
+    #[test]
+    fn test_running_sound_wanted_only_while_work_runs() {
+        let config = running_sound_config(true, &["work"]);
+        let mut state = TimerState::new(25.0, 5.0, 15.0, 4);
+
+        assert!(!running_sound_wanted(&state, &config), "idle");
+
+        state.start_work();
+        assert!(running_sound_wanted(&state, &config), "work running");
+
+        state.pause();
+        assert!(!running_sound_wanted(&state, &config), "work paused");
+
+        state.resume();
+        assert!(running_sound_wanted(&state, &config), "work resumed");
+
+        state.stop();
+        assert!(!running_sound_wanted(&state, &config), "stopped");
+    }
+
+    #[test]
+    fn test_running_sound_wanted_respects_phases() {
+        let mut state = TimerState::new(25.0, 5.0, 15.0, 4);
+        state.start_work();
+        state.phase = crate::timer::Phase::Break;
+
+        assert!(!running_sound_wanted(
+            &state,
+            &running_sound_config(true, &["work"])
+        ));
+        assert!(running_sound_wanted(
+            &state,
+            &running_sound_config(true, &["work", "break"])
+        ));
+
+        state.phase = crate::timer::Phase::LongBreak;
+        assert!(!running_sound_wanted(
+            &state,
+            &running_sound_config(true, &["break"])
+        ));
+        assert!(running_sound_wanted(
+            &state,
+            &running_sound_config(true, &["long-break"])
+        ));
+    }
+
+    #[test]
+    fn test_running_sound_wanted_disabled() {
+        let mut state = TimerState::new(25.0, 5.0, 15.0, 4);
+        state.start_work();
+        assert!(!running_sound_wanted(
+            &state,
+            &running_sound_config(false, &["work"])
+        ));
+    }
+
+    #[test]
+    fn test_running_sound_sync_is_noop_under_test_env() {
+        // SAFETY: Setting environment variable during tests is safe as tests have isolated environments
+        unsafe {
+            std::env::set_var("TOMAT_TESTING", "1");
+        }
+        let mut state = TimerState::new(25.0, 5.0, 15.0, 4);
+        state.start_work();
+        let mut running = RunningSound::default();
+        running.sync(&state, &running_sound_config(true, &["work"]));
+        assert!(running.player.is_none());
     }
 
     #[test]

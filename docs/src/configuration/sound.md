@@ -39,6 +39,38 @@ volume = 0.5
 : Path to custom sound file for work→long break transitions. Overrides embedded sound. Optional.
 
 
+## Running Sound
+
+The `[sound.running]` table plays a looping sound while the timer counts down,
+for example a ticking clock or a noise loop. It stops when the timer is paused,
+stopped, or enters a phase that is not listed in `phases`. The running sound
+needs `mode = "embedded"`.
+
+```toml
+[sound.running]
+enabled = true
+phases = ["work"]
+```
+
+`enabled`
+: Play the running sound. Default: `false`
+
+`phases`
+: Phases in which the sound plays. Any of `"work"`, `"break"`, `"long-break"`.
+  Default: `["work"]`
+
+`file`
+: Path to a custom loop file. Overrides the embedded tick. Optional.
+
+`volume`
+: Volume level for the running sound (0.0-1.0). Default: the `[sound]` `volume`
+  value.
+
+> [!NOTE]
+>
+> The audio device stays open while the running sound plays. Transition
+> sounds open the device only for a few seconds.
+
 `"enabled"`
 : Enable sound notifications.
 
@@ -80,6 +112,23 @@ To disable all audio:
 ```toml
 [sound]
 mode = "none"
+```
+
+To play the embedded tick during work sessions:
+
+```toml
+[sound.running]
+enabled = true
+```
+
+To play your own ambience loop during work and breaks at a low volume:
+
+```toml
+[sound.running]
+enabled = true
+phases = ["work", "break", "long-break"]
+file = "/home/user/sounds/cafe.ogg"
+volume = 0.2
 ```
 
 To use system beep only:

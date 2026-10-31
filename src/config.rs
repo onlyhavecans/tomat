@@ -38,6 +38,47 @@ impl From<NotificationUrgency> for notify_rust::Urgency {
     }
 }
 
+/// Phases in which the running sound can play
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunningSoundPhase {
+    Work,
+    Break,
+    LongBreak,
+}
+
+/// Looping sound that plays while the timer counts down
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RunningSoundConfig {
+    /// Enable the running sound (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+    /// Phases in which the sound plays (default: ["work"])
+    #[serde(default = "default_running_sound_phases")]
+    pub phases: Vec<RunningSoundPhase>,
+    /// Custom loop file (overrides the embedded tick)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Volume 0.0-1.0 (default: the `sound.volume` value)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<f32>,
+}
+
+fn default_running_sound_phases() -> Vec<RunningSoundPhase> {
+    vec![RunningSoundPhase::Work]
+}
+
+impl Default for RunningSoundConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            phases: default_running_sound_phases(),
+            file: None,
+            volume: None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum SoundMode {
@@ -330,6 +371,9 @@ pub struct SoundConfig {
     pub break_to_work: Option<String>,
     /// Custom sound file for work->long_break transition (overrides embedded)
     pub work_to_long_break: Option<String>,
+    /// Looping sound played while the timer runs
+    #[serde(default)]
+    pub running: RunningSoundConfig,
 }
 
 fn default_use_embedded() -> bool {
@@ -358,6 +402,7 @@ impl Default for SoundConfig {
             work_to_break: None,
             break_to_work: None,
             work_to_long_break: None,
+            running: RunningSoundConfig::default(),
         }
     }
 }
@@ -387,6 +432,19 @@ impl SoundConfig {
 
         // Default to Embedded
         SoundMode::Embedded
+    }
+
+    /// True when the running sound must play in `phase`.
+    /// The running sound needs embedded mode because it loops an audio file.
+    pub fn running_sound_enabled_for(&self, phase: RunningSoundPhase) -> bool {
+        self.running.enabled
+            && self.effective_mode() == SoundMode::Embedded
+            && self.running.phases.contains(&phase)
+    }
+
+    /// Volume for the running sound, falling back to the transition volume
+    pub fn running_sound_volume(&self) -> f32 {
+        self.running.volume.unwrap_or(self.volume)
     }
 }
 
@@ -1122,6 +1180,101 @@ mod tests {
 
         // Test invalid input
         assert!(SoundMode::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_running_sound_defaults() {
+        let config: Config = toml::from_str("[sound]\nvolume = 0.8").unwrap();
+        assert!(!config.sound.running.enabled);
+        assert_eq!(config.sound.running.phases, vec![RunningSoundPhase::Work]);
+        assert!(config.sound.running.file.is_none());
+        assert_eq!(config.sound.running_sound_volume(), 0.8);
+        assert!(
+            !config
+                .sound
+                .running_sound_enabled_for(RunningSoundPhase::Work)
+        );
+    }
+
+    #[test]
+    fn test_running_sound_enabled_work_only() {
+        let toml_str = r#"
+            [sound.running]
+            enabled = true
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(
+            config
+                .sound
+                .running_sound_enabled_for(RunningSoundPhase::Work)
+        );
+        assert!(
+            !config
+                .sound
+                .running_sound_enabled_for(RunningSoundPhase::Break)
+        );
+        assert!(
+            !config
+                .sound
+                .running_sound_enabled_for(RunningSoundPhase::LongBreak)
+        );
+    }
+
+    #[test]
+    fn test_running_sound_custom_phases_file_and_volume() {
+        let toml_str = r#"
+            [sound]
+            volume = 0.5
+
+            [sound.running]
+            enabled = true
+            phases = ["work", "break", "long-break"]
+            file = "/tmp/cafe.ogg"
+            volume = 0.2
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(
+            config
+                .sound
+                .running_sound_enabled_for(RunningSoundPhase::Break)
+        );
+        assert!(
+            config
+                .sound
+                .running_sound_enabled_for(RunningSoundPhase::LongBreak)
+        );
+        assert_eq!(config.sound.running.file.as_deref(), Some("/tmp/cafe.ogg"));
+        assert_eq!(config.sound.running_sound_volume(), 0.2);
+    }
+
+    #[test]
+    fn test_running_sound_requires_embedded_mode() {
+        for mode in ["system-beep", "none"] {
+            let toml_str = format!(
+                r#"
+                [sound]
+                mode = "{mode}"
+
+                [sound.running]
+                enabled = true
+                "#
+            );
+            let config: Config = toml::from_str(&toml_str).unwrap();
+            assert!(
+                !config
+                    .sound
+                    .running_sound_enabled_for(RunningSoundPhase::Work)
+            );
+        }
+    }
+
+    #[test]
+    fn test_running_sound_rejects_unknown_phase() {
+        let toml_str = r#"
+            [sound.running]
+            phases = ["lunch"]
+        "#;
+        assert!(toml::from_str::<Config>(toml_str).is_err());
     }
 
     #[test]

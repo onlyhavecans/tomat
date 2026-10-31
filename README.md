@@ -286,6 +286,10 @@ auto_advance = "none" # Auto-advance mode: "none", "all", "to-break", "to-work"
 mode = "embedded"     # Sound mode: "embedded", "system-beep", "none"
 volume = 0.5          # Volume level (0.0-1.0)
 
+[sound.running]
+enabled = false       # Loop a ticking sound while the timer runs
+phases = ["work"]     # Phases to play in: "work", "break", "long-break"
+
 [notification]
 enabled = true        # Enable desktop notifications
 icon = "auto"         # Icon mode: "auto", "theme", or custom path

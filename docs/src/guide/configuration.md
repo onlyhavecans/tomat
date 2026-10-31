@@ -101,6 +101,11 @@ volume = 0.5          # Volume level (0.0 to 1.0)
 # break_to_work = "/path/to/custom/break-to-work.wav"
 # work_to_long_break = "/path/to/custom/work-to-long-break.wav"
 
+# Optional: Looping sound while the timer runs (ticking clock by default)
+# [sound.running]
+# enabled = true
+# phases = ["work"]
+
 # Desktop notifications
 [notification]
 enabled = true        # Enable desktop notifications

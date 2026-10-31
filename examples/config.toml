@@ -31,6 +31,13 @@ volume = 0.5        # Volume level 0.0-1.0 (default: 0.5)
 # break_to_work = "/path/to/custom/break-to-work.wav" 
 # work_to_long_break = "/path/to/custom/work-to-long-break.wav"
 
+# Looping sound while the timer counts down (optional, needs embedded mode)
+# [sound.running]
+# enabled = true                     # Play the running sound (default: false)
+# phases = ["work"]                  # Any of "work", "break", "long-break" (default: ["work"])
+# file = "/path/to/custom/loop.ogg"  # Custom loop file (default: embedded tick)
+# volume = 0.2                       # Volume 0.0-1.0 (default: sound.volume)
+
 [notification]
 enabled = true   # Enable desktop notifications (default: true)
 icon = "auto"    # Icon mode (default: "auto")

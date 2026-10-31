@@ -90,3 +90,55 @@ Custom sound files don't play.
    mode = "embedded"
    work_to_break = "/home/user/sounds/work-done.ogg"  # Absolute path
    ```
+
+## Running Sound Does Not Play
+
+### Problem
+
+`[sound.running]` is enabled but nothing loops while the timer runs.
+
+### Solution
+
+1. **Check the sound mode**. The running sound needs `mode = "embedded"`:
+
+   ```toml
+   [sound]
+   mode = "embedded"
+
+   [sound.running]
+   enabled = true
+   ```
+
+2. **Check the phase**. By default the sound plays only during work sessions
+   and stops while the timer is paused. Add breaks if you want them:
+
+   ```toml
+   [sound.running]
+   phases = ["work", "break", "long-break"]
+   ```
+
+3. **Check the custom file**. The daemon logs a failure once per running
+   period. Restart the daemon in the foreground to see it:
+
+   ```bash
+   tomat daemon stop
+   tomat daemon run
+   ```
+
+## Running Sound Blocks Other Applications
+
+### Problem
+
+Another application cannot open the audio device while the timer runs.
+
+### Solution
+
+The running sound keeps the audio device open for the whole phase. Transition
+sounds release it after a few seconds. Use a sound server such as PipeWire or
+PulseAudio that mixes streams from several applications, or disable the running
+sound:
+
+```toml
+[sound.running]
+enabled = false
+```
